@@ -1,0 +1,27 @@
+# Injection for BigTreeTech KlipperPLR's plr.sh
+#
+# After KlipperPLR is installed, its plr.sh rebuilds the resume g-code file and
+# emits `G28 X Y` before continuing the print. On a toolchanger we must mount the
+# correct head at that point. This adds one line right after the `G28 X Y` echo
+# so the rebuilt file calls our _PLR_REPICK_TOOL (from plr-toolchanger.cfg).
+#
+# Apply from inside the KlipperPLR install dir (idempotent):
+#
+#   grep -q "_PLR_REPICK_TOOL" plr.sh || \
+#     sed -i "/echo 'G28 X Y'/a echo '_PLR_REPICK_TOOL' >> \${PLR_PATH}/\"\${plr}\"" plr.sh
+#
+# Resulting order in the rebuilt file:
+#   SET_KINEMATIC_POSITION Z=<z>   ; trusted height
+#   <re-emitted temps M104/M140/M109/M190/M106>
+#   G92 E0 / M83                   ; extrusion mode restored
+#   G91 / G1 Z10 / G90             ; lift clear of the layer
+#   G28 X Y                        ; home XY at the lifted height
+#   _PLR_REPICK_TOOL               ; <-- INJECTED: mount saved head (guarded)
+#   G91 / G1 Z-5 / G90             ; drop back toward the print
+#   M106 S204                      ; fan
+#   <remainder of the original g-code from the interruption point>
+#
+# NOTE: validate on the bench that _PLR_REPICK_TOOL's SELECT motion leaves Z/XY
+# in a sane state for the following `G1 Z-5`. SELECT_PHx re-homes XY and applies
+# the tool's gcode offset; if the drop needs adjustment, tune here rather than in
+# SELECT.

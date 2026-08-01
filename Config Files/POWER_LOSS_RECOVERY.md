@@ -1,71 +1,94 @@
-# Power-Loss Recovery (experimental)
+# Power-Loss Recovery (ProForge 5, experimental)
 
-Adds an opt-in "resume after power loss" flow for the ProForge 5, integrated
-with the toolchanger so recovery re-picks the correct head.
+Adds opt-in "resume after power loss" by **wrapping** the proven
+[BigTreeTech KlipperPLR](https://github.com/bigtreetech/KlipperPLR) engine and
+patching in the ProForge's toolchanger head re-pick. Nothing here is enabled by
+default.
 
-**This is untested scaffolding.** It is not wired into `printer.cfg`. Treat it as
-a starting point to bench-test, not a finished feature.
+## Why wrap KlipperPLR instead of rolling our own
+KlipperPLR's shell script rebuilds a **fresh resume g-code file** from the
+interruption point: it re-emits temperatures, restores extrusion mode
+(`M83`/`G92 E0`), sets the trusted Z, lifts, homes XY, drops, and continues. That
+removes the two failure modes an in-house macro kept tripping on — relative-E
+mismatch on resume, and writing/corrupting state in the offsets file. We only add
+the toolchanger bits.
 
-## Why this exists
-Klipper has no native power-loss recovery: on an outage klippy restarts with no
-position, homing, or tool state, so the "resume" option only appears
-inconsistently (basically never after a real outage). This makes it consistent by
-continuously saving print state to disk during the print and providing a
-`RESUME_INTERRUPTED` macro.
+## Dependency
+Requires `fix/toolchanger-safety` merged (guarded `SELECT_PHx`). Recovery mounts a
+head via `SELECT`, and without the collision guard a bad state can crash heads.
 
-## Dependency — land the safety fix first
-Requires `fix/toolchanger-safety`. Recovery re-picks a head via `SELECT_PHx`, and
-if the collision guard is missing a bad state can drive one head into another.
-Do not enable PLR without that branch merged.
+## Install
+1. **KlipperPLR engine**
+   ```bash
+   git clone https://github.com/bigtreetech/KlipperPLR
+   cd KlipperPLR && ./install.sh
+   ```
+2. **De-dupe the generated `plr.cfg`** so it doesn't clash with the ProForge
+   config. Delete these blocks from the KlipperPLR `plr.cfg`:
+   - the second `[save_variables]`  (printer.cfg already declares one)
+   - `[respond]`                    (already provided)
+   - `[delayed_gcode KINEMATIC_POSITION]` that zeroes X/Y/Z at boot — it fights
+     the ProForge homing / `safe_z_home` flow.
+3. **Patch `plr.sh`** to call our re-pick (see `plr-repick.patch`):
+   ```bash
+   grep -q "_PLR_REPICK_TOOL" plr.sh || \
+     sed -i "/echo 'G28 X Y'/a echo '_PLR_REPICK_TOOL' >> \${PLR_PATH}/\"\${plr}\"" plr.sh
+   ```
+4. **Include our integration** in `printer.cfg`, after the KlipperPLR include:
+   ```
+   [include plr-toolchanger.cfg]
+   ```
 
-## Enable (once tested)
-1. Merge `fix/toolchanger-safety`.
-2. `[include power-loss-recovery.cfg]` in `printer.cfg`.
-3. Add `_PLR_ON_LAYER` to Orca's **Layer change G-code** (snapshots each layer).
-4. Add `_PLR_CLEAR` to the end-print and cancel paths (so a clean finish doesn't
-   leave a stale resume offer).
+## Slicer hooks (Orca)
+- **Machine start G-code** (near the top, in addition to the existing routine):
+  ```
+  G31
+  save_last_file
+  SAVE_VARIABLE VARIABLE=was_interrupted VALUE=True
+  ```
+- **Layer change G-code** — use our snapshot (captures Z *and* tool):
+  ```
+  _PLR_LOG_STATE
+  ```
+- **Machine end G-code**:
+  ```
+  SAVE_VARIABLE VARIABLE=was_interrupted VALUE=False
+  clear_last_file
+  G31
+  ```
+  Also make sure `CANCEL_PRINT` clears it (`SAVE_VARIABLE VARIABLE=was_interrupted VALUE=False`)
+  so a cancel doesn't leave a stale resume offer.
 
-## How it works
-- `_PLR_ON_LAYER` (per layer) saves file, `virtual_sdcard.file_position`, Z,
-  layer, active tool, and bed/tool target temps into the existing
-  `[save_variables]` file.
-- On startup, `_PLR_ON_READY` checks `plr_state` and, if a print was live, tells
-  the user a resume is available.
-- `RESUME_INTERRUPTED`: reheats, trusts saved Z (`SET_KINEMATIC_POSITION`), blind
-  Z-lift to clear the layer, homes XY, re-picks the saved head (guarded),
-  restores Z, primes, then continues the SD file from the saved byte offset
-  (`M23`/`M26`/`M24`).
+## Recovering after an outage
+Do **not** move the gantry. Run `RESUME_INTERRUPTED` in the Mainsail console.
+It rebuilds the resume file and runs it: set Z → reheat → lift → home XY →
+`_PLR_REPICK_TOOL` (mount the saved head) → drop → continue.
 
-## Known-fragile points to validate on the bench
-1. **Z is trusted, never re-probed.** Depends on the four Z leadscrews holding
-   position unpowered. Do not touch the gantry after an outage. Re-probing is not
-   an option — the Eddy would have to descend into the printed part.
-2. **Nozzle-weld.** A cold nozzle fused to the top layer can peel the part on the
-   first lift. No software fixes this.
-3. **Byte-seek resume (`M26`).** Assumes the saved position is a clean layer
-   boundary (it is, saved at layer change) and that modal state (G90/M83/fan/
-   accel) matches what `RESUME_INTERRUPTED` sets. The community plugins instead
-   *rebuild a resume g-code file* with a fresh header — more robust; worth
-   evaluating (see below).
-4. **Frequent `SAVE_VARIABLE` writes** rewrite the whole variables file each
-   layer. Fine for occasional/slow prints; consider a dedicated save file or a
-   time-throttle for very fast/thin-layer prints.
+## Logging (for future debugging)
+`_PLR_LOG_STATE` writes a `PLR_SNAPSHOT z=… tool=… layer=…` line to klippy.log
+every layer, and `_PLR_REPICK_TOOL` logs the carriage/dock sensor states before
+and after the re-pick. After any failed resume, those breadcrumbs in klippy.log
+show exactly where it was and what the toolchanger believed.
 
-## Test plan (do this, in order, before trusting it)
-1. Small test print. Mid-print, run `FIRMWARE_RESTART` (NOT a real power cut).
-2. Confirm `_PLR_ON_READY` reports the correct tool/Z/layer.
-3. With the **emergency stop in reach**, run `RESUME_INTERRUPTED`. Watch the
-   Z-lift, XY home, and tool re-pick for any collision; `M112` if anything looks
-   wrong.
-4. Only once several restart-resumes succeed cleanly, try a real breaker-flip
-   test on a throwaway print.
+## Residual limitations — NO software fixes these (validate/accept before trusting)
+- **B3 — trusted Z, four independent leadscrews.** Recovery assumes Z held with
+  power off. Your `z_tilt` has four Z motors; uneven relaxation → wrong/tilted Z
+  on resume. Single-leadscrew machines (KlipperPLR's target) don't have this.
+- **B4 — nozzle welded to the part.** A cold nozzle fused to the top layer can
+  peel the print on the first lift. Nothing software-side prevents it.
+- **B5 — filenames.** Your files contain spaces and `+`
+  (`Wikinger+Doppelaxt_0.2mm_PLA_ProForge 5_…`). KlipperPLR round-trips the name
+  through `save_variables` and the shell; verify a resume works with a spaced/`+`
+  filename before relying on it (test plan step 2).
+- **The reliable fix is still hardware:** a UPS sized for the printer, or a small
+  UPS + a mains-loss GPIO that fires a fast park+save. This is best-effort software.
 
-## Alternatives worth considering instead of this hand-rolled version
-- **[BTT KlipperPLR](https://github.com/bigtreetech/KlipperPLR)** or
-  **[ankurv2k6/klipper-plr](https://github.com/ankurv2k6/klipper-plr)** as the
-  state-saving/resume engine, with the ProForge tool re-pick grafted into their
-  `RESUME_INTERRUPTED`. These are more battle-tested than this file; this cfg can
-  serve as the toolchanger-integration reference.
-- **The reliable fix is hardware:** a UPS sized for the whole printer, or a small
-  UPS + a mains-loss GPIO that fires a fast "lift, park, heaters off, save state"
-  before the UPS dies. Software PLR is best-effort; hardware prevents the loss.
+## Test plan (in order, emergency stop in reach)
+1. Small print. Mid-print run `FIRMWARE_RESTART` (never a real outage first).
+2. Confirm `was_interrupted`/`power_resume_z`/`power_resume_tool` saved, and that
+   the filename (with spaces/`+`) round-tripped.
+3. Run `RESUME_INTERRUPTED`. Watch the lift → XY home → **tool re-pick** → drop
+   for any collision; `M112` if anything looks wrong.
+4. Repeat with a multi-tool print so `_PLR_REPICK_TOOL` mounts a non-PH1 head.
+5. Only after several clean restart-resumes, try a real breaker flip on a scrap
+   print.
