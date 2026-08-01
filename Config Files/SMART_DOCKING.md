@@ -15,11 +15,22 @@ blind servo, with no verification):
 - The pull-out already happens (`G0 X{select_x + 8}`), so verifying is nearly
   free: read the sensor there.
 
+## Why this may fix more than grab reliability
+PH1 is the **reference head**: the print-start `TAP` sets the first-layer Z with
+PH1, and `TOOL_LOCATE_SENSOR` measures every other head's offset relative to PH1.
+So if PH1's *seated position on the carriage varies pickup-to-pickup* (the same
+inconsistency behind falls-off-vs-wall), that variation propagates into:
+- **non-repeatable tool-offset calibration** (the reference moves), and
+- **±1 mm first-layer Z each print** (TAP runs on an inconsistently-seated PH1).
+Consistent seating is therefore a candidate root cause for all three symptoms,
+not just grab reliability. Worth testing PH1's seated-Z repeatability directly.
+
 ## Roadmap
-1. **`DOCK_PROBE` (this branch)** — instrument latch-success vs seat depth,
-   safely (never past nominal `select_x`). Run `DOCK_PROBE PH=1..5`, read the
-   shallowest depth that still latches. Gives us: the latch margin per head, and
-   whether nominal is marginal.
+1. **`DOCK_PROBE` (this branch)** — instrument latch-success vs *extra* seat depth
+   past nominal, safely (reduced current so a wall hit slips, re-home each step,
+   bounded to +1 mm). Nominal is the empirically-found working point; reliability
+   headroom is DEEPER, so we sweep nominal → +1 mm and find the deepest seat that
+   latches cleanly. Run `DOCK_PROBE PH=1..5`.
 2. **Tune two numbers** from the probe + a reduced-current test:
    - reduced X/Y current for the seat push (normal is 2.2 A) that still seats the
      pin but *slips* at the wall instead of skipping steps;
