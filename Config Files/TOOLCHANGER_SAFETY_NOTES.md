@@ -21,6 +21,36 @@ setup routine *after* that `DOCK`, with a head mounted, defeats the only guard.
 `carriage_tool_sensor` reads PRESSED, run `DOCK` first. Protects all callers
 regardless of how the routine was entered.
 
+**Hardening (red-team A1/A2).**
+- *A1 — closed the bypass.* If `DOCK` cannot resolve which head to dock it
+  pauses only while `print_stats.state == "printing"`; run from the console it
+  would leave the head mounted and the old code plunged anyway. The guard now
+  calls `_CAL_VERIFY_CLEAR` (a **separate** macro, because Klipper renders a
+  macro's template before its sub-macro's moves run) which `M400`s, re-reads the
+  sensor, and `action_raise_error`s if the carriage is still occupied — aborting
+  the whole `_CAL_SELECT` chain so the plunge never happens.
+- *A2 — fresh sensor read.* The guard now `M400`s before reading
+  `carriage_tool_sensor`, so a value that is stale behind queued motion can't slip
+  through.
+- *A3 — residual.* Still only as good as the sensor: a false-negative
+  `carriage_tool_sensor` (reads RELEASED with a head on) defeats it. Same
+  dependency as the stock `SELECT` path — not a regression.
+
+## 1b. Dock reseat + diagnostics (NEW, `toolchanger-extras.cfg`)
+
+`RESEAT_DOCKS` addresses the common "multiple heads read undocked" `DOCK` error,
+which usually just means a head isn't pushed fully into its dock. With the
+carriage empty and XY homed, it gently pushes each undocked head to its seated
+dock X (never past it, so it can't jam) and verifies the switch. The `DOCK`
+multiple-undocked error message now points at `RESEAT_DOCKS`.
+
+`_TC_LOG` writes a one-line snapshot (carriage sensor, all dock sensors, active
+extruder, homed axes, `can_continue`, `already_selected`) to klippy.log. It is
+wired into `DOCK` entry and the multiple-undocked branch, and into `RESEAT_DOCKS`
+and the PLR re-pick, so a future failure can be reconstructed from the log.
+
+Requires `[include toolchanger-extras.cfg]` in `printer.cfg` (added).
+
 ## 2. Resume state can disagree with the physical carriage (FOLLOW-UP, not fixed)
 
 `PAUSE` sets `RESUME.extruder_restore_tool` from `printer.toolhead.extruder`
