@@ -51,35 +51,34 @@ and the PLR re-pick, so a future failure can be reconstructed from the log.
 
 Requires `[include toolchanger-extras.cfg]` in `printer.cfg` (added).
 
-## 2. Resume state can disagree with the physical carriage (FOLLOW-UP, not fixed)
+## 2. Resume state can disagree with the physical carriage (FIXED)
 
-`PAUSE` sets `RESUME.extruder_restore_tool` from `printer.toolhead.extruder`
-(the active *extruder*), which always names some tool whether or not a head is
-physically mounted. `RESUME` then keys entirely off that variable
-(`{% if extruder_restore_tool >= 0 %}`) and never consults `carriage_tool_sensor`.
-So the software belief and the physical carriage can diverge across a
-pause/resume, which is how a head ends up mounted while the routine "forgets" it.
+Originally `PAUSE`/`RESUME` keyed entirely off `RESUME.extruder_restore_tool`
+(the active *extruder*, which always names some tool whether or not a head is
+physically mounted) and never consulted `carriage_tool_sensor`, so the software
+belief and the physical carriage could diverge across a pause/resume.
 
-Proposed follow-up (separate commit): have `RESUME` reconcile against the
-physical sensor — if `carriage_tool_sensor` is PRESSED, `DOCK`/verify before
-resuming; if it is RELEASED, don't try to wipe/select a tool that isn't there.
-The guard in (1) already prevents the *collision*; this would fix the root
-state-tracking mismatch.
+**Fixed.** `_PRE_SELECT_CHECK` now records `pending_tool` (the target of an
+in-progress change), and `RESUME` reconciles against the physical sensors before
+continuing. It acts only when BOTH the carriage switch and the target's dock
+sensor AGREE: a head confirmed on the carriage resumes; a confirmed-empty carriage
+re-grabs the pending tool and verifies it; any sensor disagreement REFUSES and
+stays paused for the operator. So it never resumes into an empty carriage
+(headless) and never re-grabs a head that is already held (which would drop it).
 
-## 3. Redundant PH1 dock+re-grab on PH1-first prints (FOLLOW-UP, needs testing)
+## 3. Redundant PH1 dock+re-grab on PH1-first prints (FIXED, slicer-side)
 
-In the start G-code (Orca profile `machine_start_gcode`), TAP always runs on PH1
-via `_CAL_SELECT_T0` → `TAP` → `DOCK`. Then each used extruder is primed
-(`_PRIME_PHx`, which picks up, primes, and docks), then the initial tool is
-selected (`SELECT_PHx`). When the first print tool **is** PH1, PH1 gets grabbed
-three times (TAP, prime, select), each with a dock + ~20 cm +X clearance move +
-re-grab — the "releases the tool, moves ~20 cm X+, immediately grabs it again"
-behavior.
+The start G-code primed every used extruder via `_PRIME_PHx` (grab, prime, dock)
+and THEN selected the initial tool via `SELECT_PHx` (which itself grabs and
+primes), so the initial tool was primed twice and picked up an extra time — when
+the initial tool is PH1 it was grabbed three times (TAP, prime, select).
 
-Why it is not a trivial skip: simply removing the post-TAP `DOCK` would leave PH1
-mounted, and `SELECT_PH1`/`_PRE_SELECT_CHECK` would then take the
-"already selected → skip" branch — which also skips the prime, `_OFFSET_RESET`,
-and the `extruder_restore_tool` bookkeeping that `_SELECT_PHx` performs. So this
-needs a small refactor (e.g. an "already-mounted" path in `_SELECT_PHx` that
-still runs prime/offset/bookkeeping), and must be validated on-machine. Tracked
-here rather than shipped half-done.
+**Fixed** in the Orca profile (`Orca-Slicer-Profiles`, ProForge 5
+`machine_start_gcode`): each `_PRIME_PHx` is guarded with `initial_tool != n`, so
+the initial tool is primed exactly once — by `SELECT_PHx` — and not redundantly
+picked up beforehand. PH1-first drops from 3 pickups to 2.
+
+Not fully eliminated: TAP still grabs PH1, and PH1 must dock to heat safely (ooze
+in the dock zone), so a PH1-first print still picks PH1 up twice (TAP + select).
+Getting to a single pickup means keeping the head held through heating over the
+ooze bucket — geometry/ooze-sensitive, left as a follow-up.
